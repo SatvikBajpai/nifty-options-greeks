@@ -18,6 +18,8 @@ from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import requests
 
 from .config import BASE, FO, HTTP_HEADERS, RAW_FO, UDIFF_START, DEFAULT_SYMBOLS
@@ -155,10 +157,45 @@ def day_parquet(d: date) -> Path:
     return FO / f"{d:%Y}" / f"fo_{d:%Y%m%d}.parquet"
 
 
+_ALL = "__all__"
+
+
+def _write_day(df: pd.DataFrame, out: Path, symbols) -> None:
+    """Write a day, stamping which symbols it was filtered to into the footer."""
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    meta = dict(table.schema.metadata or {})
+    meta[b"virain_symbols"] = (",".join(sorted(symbols)) if symbols else _ALL).encode()
+    out.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(table.replace_schema_metadata(meta), out, compression="zstd")
+
+
+def _cached_covers(out: Path, symbols) -> bool:
+    """Does an existing day file already contain every symbol we were asked for?
+
+    A day parquet is filtered to a symbol list, so the file alone cannot answer
+    this - without the stamp, asking for BANKNIFTY on a machine that had only
+    ever parsed NIFTY returned 'cached' and silently produced zero rows. Files
+    written before the stamp existed report unknown and are re-parsed, which is
+    cheap because the raw zip is already on disk.
+    """
+    try:
+        stamped = (pq.read_schema(out).metadata or {}).get(b"virain_symbols")
+    except Exception:
+        return False
+    if stamped is None:
+        return False
+    have = stamped.decode()
+    if have == _ALL:
+        return True
+    if not symbols:
+        return False                       # asked for everything, have a subset
+    return set(symbols) <= set(have.split(","))
+
+
 def build_day(d: date, symbols=DEFAULT_SYMBOLS, session=None, force=False) -> str:
     """Download + normalise one day. Returns 'ok' | 'cached' | 'holiday'."""
     out = day_parquet(d)
-    if out.exists() and not force:
+    if out.exists() and not force and _cached_covers(out, symbols):
         return "cached"
     blob = fetch(d, session=session)
     if blob is None:
@@ -166,8 +203,7 @@ def build_day(d: date, symbols=DEFAULT_SYMBOLS, session=None, force=False) -> st
     df = normalise(blob, d)
     if symbols:
         df = df[df["symbol"].isin(list(symbols))]
-    out.parent.mkdir(parents=True, exist_ok=True)
-    df.to_parquet(out, index=False, compression="zstd")
+    _write_day(df, out, symbols)
     return "ok"
 
 
